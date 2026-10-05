@@ -1,0 +1,14 @@
+{
+    "configurations": [
+        {
+            "type": "java",
+            "name": "Spring Boot-MindConnectApplication<infrastructure>",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "mainClass": "springboot.infrastructure.MindConnectApplication",
+            "projectName": "infrastructure",
+            "args": "",
+            "envFile": "${workspaceFolder}/.env"
+        }
+    ]
+}
