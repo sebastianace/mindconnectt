@@ -1,0 +1,9 @@
+.env
+.idea/
+target/
+**/target/
+.maven-cache/
+*.iml
+.DS_Store
+Thumbs.db
+*.tmp
