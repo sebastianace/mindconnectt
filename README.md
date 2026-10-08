@@ -1,15 +1,15 @@
 # MindConnect · Migraciones con Flyway + DDD + Arquitectura Hexagonal
 
-API REST de MindConnect (plataforma de salud mental) construida con **Java 21**, **Spring Boot 4**, **Spring Data JPA**, **Flyway** y **MySQL 8**, organizada con **Domain-Driven Design** y **arquitectura hexagonal** (puertos y adaptadores).
+API REST de MindConnect (plataforma de salud mental) construida con **Java 21**, **Spring Boot 4**, **Spring Data JPA**, **Flyway**, **Spring Security + JWT** y **MySQL 8**, organizada con **Domain-Driven Design** y **arquitectura hexagonal** (puertos y adaptadores).
 
 El esquema tiene **52 tablas**. Cada tabla es un *bounded context* con sus tres capas (`domain`, `application`, `infrastructure`) dentro de una sola aplicación Spring Boot y una sola base de datos (monolito modular, no microservicios).
 
 | Métrica | Valor |
 | --- | --- |
-| Tablas / migraciones Flyway | 52 / 52 |
+| Tablas / migraciones Flyway | 55 / 56 (52 del esquema + 3 de seguridad: `roles`, `users`, `user_roles`) |
 | Bounded contexts | 52 |
 | Llaves foráneas validadas en casos de uso | 70 |
-| Pruebas unitarias | 178 (68 dominio + 110 aplicación) |
+| Pruebas unitarias | 198 (75 dominio + 117 aplicación + 6 infraestructura) |
 | Archivos Java | 1.375 |
 
 ---
@@ -143,6 +143,8 @@ Restricciones destacadas:
 | `ck_ai_models_prices`, `ck_ai_models_tokens` | Precios y límites de tokens válidos |
 | `ck_chat_ai_run_metrics_tokens`, `ck_chat_ai_run_metrics_cost` | Métricas coherentes |
 
+Las migraciones `V53` a `V56` agregan `roles`, `users`, `user_roles` y siembran `ROLE_USER` y `ROLE_ADMIN` (ver sección 8).
+
 Hibernate trabaja con `ddl-auto: validate`: **Flyway es el único dueño del esquema** e Hibernate solo verifica que las entidades coincidan con las tablas.
 
 > Regla de oro: no se editan migraciones ya aplicadas en una base con datos. Cualquier cambio futuro va en una nueva `V53__...sql`.
@@ -249,6 +251,10 @@ SPRING_PROFILES_ACTIVE=dev
 SERVER_PORT=8081
 CORS_ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000
 QUEUE_BLOCK_USERS_FIXED_DELAY_MS=5000
+JWT_SECRET=<salida de: openssl rand -base64 48>
+JWT_EXPIRATION_MS=3600000
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=<minimo 8 caracteres>
 ```
 
 `.env` está en `.gitignore`: nunca lo subas al repositorio.
@@ -306,8 +312,9 @@ FROM flyway_schema_history ORDER BY installed_rank;
 
 | Módulo | Qué se prueba |
 | --- | --- |
-| `domain` | Creación de los 52 agregados con su evento; `DomainGuard`; invariantes de `Patient`, `TreatmentPlan` y `ChatAiRunMetric` |
-| `application` | `Delete` de los 52 contextos (incluye publicación del evento); registro de `StateRegion` con referencia inexistente (422) y código duplicado (409); actualización de `Country` con evento, 404 y regla de dominio |
+| `domain` | Creación de los 52 agregados con su evento; `DomainGuard`; invariantes de `Patient`, `TreatmentPlan`, `ChatAiRunMetric`, `User` (username, hash, al menos un rol) y `Role` (prefijo `ROLE_`) |
+| `application` | `Delete` de los 52 contextos (incluye publicación del evento); registro de `StateRegion` con referencia inexistente (422) y código duplicado (409); actualización de `Country` con evento, 404 y regla de dominio; registro de usuarios (rol, hash, duplicado 409, contraseña corta o de más de 72 bytes) y listado sin contraseñas |
+| `infrastructure` | `TokenJwtConfig`: emisión y lectura del JWT, token vencido, manipulado o firmado con otra clave, y clave débil. Sin Spring ni base de datos |
 
 Las pruebas usan repositorios en memoria que implementan los puertos del dominio: no necesitan Spring ni base de datos, lo que demuestra que el núcleo es independiente de la infraestructura.
 
@@ -327,6 +334,74 @@ Las pruebas usan repositorios en memoria que implementan los puertos del dominio
 
 ---
 
-## 8. Alcance
+## 8. Seguridad (Spring Security + JWT)
 
-El proyecto implementa el esquema completo con Flyway y un CRUD con reglas de negocio para los 52 contextos. No incluye autenticación, lógica clínica ni integración real con modelos de IA, porque no forman parte del alcance de la actividad.
+API **stateless**: no hay sesión en el servidor; cada petición protegida lleva un JWT firmado en el encabezado `Authorization: Bearer <token>`.
+
+> **Versión:** el taller de la guía es de Spring Security 6; este proyecto usa Spring Boot 4.0.2, que trae **Spring Security 7**. El DSL con lambdas del taller (`authorizeHttpRequests`, `csrf`, `sessionManagement`) se mantiene igual; los cambios de la 7 (por ejemplo, `PathPatternRequestMatcher` en lugar de `AntPathRequestMatcher`) no afectan este código.
+
+### Estructura (respeta la arquitectura hexagonal)
+
+```
+domain/        role/ y user/   Role, User (agregados), puertos UserRepository, RoleRepository, PasswordHasher
+application/   user/usecase    RegisterUserUseCase, ListUserUseCase (Java puro, sin Spring)
+infrastructure/
+  user/, role/                 persistencia JPA, UserController, ensamblado de beans
+  security/                    SpringSecurityConfig, TokenJwtConfig, JpaUserDetailsService,
+                               RestAuthenticationEntryPoint (401), RestAccessDeniedHandler (403),
+                               AdminBootstrapRunner
+  security/filter/             JwtAuthenticationFilter (login) y JwtValidationFilter (valida el token)
+```
+
+Los nombres de `security/` siguen los del taller. `JpaUserDetailsService` usa los **puertos del dominio** en lugar de un repositorio JPA directo.
+
+### Endpoints
+
+| Método | Ruta | Acceso |
+| --- | --- | --- |
+| `POST` | `/api/auth/login` | Público. Cuerpo `{"username","password"}`; responde el JWT |
+| `POST` | `/api/users/register` | Público. Crea un usuario con `ROLE_USER` |
+| `POST` | `/api/users` | Solo `ROLE_ADMIN`. Crea usuarios y, con `"admin": true`, administradores |
+| `GET` | `/api/users` | Solo `ROLE_ADMIN`. Lista usuarios (nunca incluye contraseñas) |
+| `DELETE` | `/api/**` | Solo `ROLE_ADMIN` |
+| Resto de `/api/**` | | Cualquier usuario autenticado |
+
+Errores de seguridad en el mismo formato `application/problem+json`: `401` sin token, con token inválido o vencido, o con credenciales incorrectas; `403` si el rol no alcanza.
+
+### Decisiones de diseño
+
+- **Sin autoasignación de administrador.** En el taller el registro público acepta un campo `admin`, lo que permite a cualquiera crearse como administrador. Aquí el registro público siempre entrega `ROLE_USER`; solo un administrador puede crear otros.
+- **Primer administrador por variables de entorno.** Si `ADMIN_USERNAME` y `ADMIN_PASSWORD` están definidos, `AdminBootstrapRunner` lo crea al arrancar (una sola vez). Ninguna credencial queda en el código ni en las migraciones.
+- **Clave JWT estable.** En el taller la clave se genera en cada arranque y los tokens mueren al reiniciar. Aquí viene de `JWT_SECRET` (Base64, mínimo 256 bits); la app no arranca si falta o es débil.
+- **Filtro de validación.** El taller termina al generar el token; `JwtValidationFilter` lo verifica (firma y expiración) en cada petición para que los endpoints protegidos lo acepten.
+- **Contraseñas con BCrypt** vía el puerto `PasswordHasher`; el dominio solo guarda el hash. Se rechazan contraseñas de más de 72 bytes (límite de BCrypt) en lugar de truncarlas en silencio.
+- **Mensaje de login único.** No distingue entre usuario inexistente, clave errónea o cuenta deshabilitada.
+- Los roles viajan en el token, así que un cambio de rol aplica cuando el token vence (`JWT_EXPIRATION_MS`, 1 hora por defecto).
+
+### Probar el flujo
+
+```
+# 1. Registrar un usuario (201, ROLE_USER)
+curl -s -X POST http://localhost:8081/api/users/register -H "Content-Type: application/json" \
+  -d '{"username":"sebastian","password":"Clave12345"}'
+
+# 2. Sin token (401)
+curl -i http://localhost:8081/api/countries
+
+# 3. Iniciar sesión y copiar el token
+curl -s -X POST http://localhost:8081/api/auth/login -H "Content-Type: application/json" \
+  -d '{"username":"sebastian","password":"Clave12345"}'
+
+# 4. Con token (200)
+curl -s http://localhost:8081/api/countries -H "Authorization: Bearer TU_TOKEN"
+
+# 5. Un usuario normal intentando borrar (403)
+curl -i -X DELETE http://localhost:8081/api/countries/00000000-0000-0000-0000-000000000000 \
+  -H "Authorization: Bearer TU_TOKEN"
+```
+
+---
+
+## 9. Alcance
+
+El proyecto implementa el esquema completo con Flyway, un CRUD con reglas de negocio para los 52 contextos y autenticación/autorización con Spring Security y JWT. No incluye lógica clínica ni integración real con modelos de IA, porque no forman parte del alcance de la actividad.
